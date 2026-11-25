@@ -1,0 +1,15 @@
+{
+  "name": "agent-crew",
+  "description": "Agent Crew: watch your Claude lead model, its helper agents and their MCP tools work, live.",
+  "owner": {
+    "name": "lurkar",
+    "url": "https://github.com/lurkar"
+  },
+  "plugins": [
+    {
+      "name": "agent-crew",
+      "source": "./",
+      "description": "See your Claude crew work, live: the lead model, every helper agent with its model and task, and the tools and MCP servers they use, drawn as pixel creatures beside the chat."
+    }
+  ]
+}
