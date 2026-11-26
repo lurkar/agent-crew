@@ -1,6 +1,6 @@
 {
   "name": "agent-crew",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "See your Claude crew work, live: the lead model, every helper agent it hands work to (with its model and task), and the tools and MCP servers each one is using, drawn as pixel creatures beside the chat.",
   "author": { "name": "lurkar", "url": "https://github.com/lurkar" },
   "homepage": "https://github.com/lurkar/agent-crew",

@@ -23,6 +23,9 @@ const LINE = '#3a3935'
 const DOT = '#2c2b27'
 const PANEL = '#1d1c19'
 const RED = '#e5484d'
+const AMBER = '#f5a524'
+const PINK = '#ff5fb8'
+const VIOLET = '#8b5cf6'
 
 export const COLOR: Record<Family, string> = {
   fable: '#e8b04b',
@@ -236,10 +239,78 @@ export function setLead(c: Crew, busy: boolean, model?: string): Crew {
   const name = model ? prettyModel(model) : c.lead.model
   const family = model ? familyOf(model) : c.lead.family
   const keepTool = busy ? c.lead.tool : undefined
-  if (c.lead.busy === busy && c.lead.model === name && c.lead.family === family && c.lead.tool === keepTool) return c
+  // a new model asked for: what the old one replied no longer applies
+  const replied = name === c.lead.model ? c.lead.replied : undefined
+  if (
+    c.lead.busy === busy &&
+    c.lead.model === name &&
+    c.lead.family === family &&
+    c.lead.tool === keepTool &&
+    c.lead.replied === replied
+  )
+    return c
   const lead: CrewLead = { model: name, family, busy }
   if (keepTool !== undefined) lead.tool = keepTool
+  if (replied !== undefined) lead.replied = replied
+  if (c.lead.ultra) lead.ultra = true
   return { ...c, lead }
+}
+
+/** Two names for one model: same family, and the same version wherever both give one ("Sonnet" is "Sonnet 5.5"). */
+export function sameModel(a: string, b: string): boolean {
+  if (familyOf(a) !== familyOf(b)) return false
+  const va = a.replace(/^\D+/, '').trim()
+  const vb = b.replace(/^\D+/, '').trim()
+  return !va || !vb || va === vb
+}
+
+/** Notes the model a reply came from; logs a fallback the first time it differs from the one asked for. */
+export function setReplied(c: Crew, agentId: string | undefined, raw: string, at: number): Crew {
+  const name = prettyModel(raw)
+  if (agentId === undefined) {
+    if (c.lead.replied === name) return c
+    const was = c.lead.replied ?? c.lead.model
+    const next: Crew = { ...c, lead: { ...c.lead, replied: name } }
+    return !sameModel(name, c.lead.model) && !sameModel(was, name)
+      ? addLog(next, `⚠ lead asked for ${c.lead.model}, replying as ${name}`, familyOf(name), at)
+      : next
+  }
+  const a = c.agents.find(x => x.id === agentId)
+  if (!a || a.replied === name) return c
+  const was = a.replied ?? a.model
+  const next: Crew = { ...c, agents: c.agents.map(x => (x.id === agentId ? { ...x, replied: name } : x)) }
+  return !sameModel(name, a.model) && !sameModel(was, name) ? addLog(next, `⚠ ${a.model} fell back to ${name}: ${a.task}`, familyOf(name), at) : next
+}
+
+/** Turns the lead's workflow (Ultracode) glow on or off. */
+export function setUltra(c: Crew, on: boolean): Crew {
+  if (!!c.lead.ultra === on && (!on || c.lead.busy)) return c
+  const lead: CrewLead = { ...c.lead }
+  // a call of the lead's means the lead is at work
+  if (on) Object.assign(lead, { ultra: true, busy: true })
+  else delete lead.ultra
+  return { ...c, lead }
+}
+
+/** True while a workflow runs: the lead's own call, or any of its agents still at work. */
+export function isUltra(c: Crew): boolean {
+  return !!c.lead.ultra || c.agents.some(a => a.status === 'working' && !!a.run)
+}
+
+/** A helper as drawn: the model that is really replying, and the one asked for when they differ. */
+export type Shown = CrewAgent & { asked?: string }
+
+export function shown(a: CrewAgent): Shown {
+  if (!a.replied || a.replied === a.model) return a
+  // the same model under a fuller name: show the fuller one
+  if (sameModel(a.replied, a.model)) return a.replied.length > a.model.length ? { ...a, model: a.replied } : a
+  return { ...a, model: a.replied, family: familyOf(a.replied), asked: a.model }
+}
+
+export function shownLead(l: CrewLead): CrewLead & { asked?: string } {
+  if (!l.replied || l.replied === l.model) return l
+  if (sameModel(l.replied, l.model)) return l.replied.length > l.model.length ? { ...l, model: l.replied } : l
+  return { ...l, model: l.replied, family: familyOf(l.replied), asked: l.model }
 }
 
 /** Forgets every tool in use: for a fresh start, when nobody is left to say a call ended. */
@@ -492,7 +563,7 @@ export function layoutFor(columns: number): Layout {
   const statusY = labelY + 14
   const busY = statusY + 18
   const panelTop = busY + 36
-  const helperBottom = panelTop + 100
+  const helperBottom = panelTop + 112
   const toolBusY = helperBottom + 10
   const toolTop = toolBusY + 19
   return {
@@ -539,15 +610,17 @@ function visibleTools(c: Crew, max: number): CrewTool[] {
 
 export function crewSvg(c: Crew, L: Layout, now: number): string {
   const { W, H, cx, cy, r } = L
-  const helpers = visibleHelpers(c, L.maxHelpers)
+  const helpers = visibleHelpers(c, L.maxHelpers).map(shown)
   const hSlot = Math.min(112, (W - 32) / Math.max(1, helpers.length))
   const hx = spread(helpers.length, cx, hSlot)
   const tools = visibleTools(c, L.maxTools)
   const tx = spread(tools.length, cx, Math.min(84, (W - 52) / Math.max(1, tools.length)))
-  const lead = c.lead
+  const lead = shownLead(c.lead)
   const leadColor = COLOR[lead.family]
+  const ultra = isUltra(c)
   const working = c.agents.filter(a => a.status === 'working')
-  const unseen = working.filter(a => !helpers.includes(a)).length
+  const onShow = new Set(helpers.map(h => h.id))
+  const unseen = working.filter(a => !onShow.has(a.id)).length
   const idle: string[] = []
   const live: string[] = []
   const front: string[] = []
@@ -605,22 +678,32 @@ export function crewSvg(c: Crew, L: Layout, now: number): string {
         `<g>${pixelRows(SPARK, cx + dx, cy + dy, 2, busy ? leadColor : FAINT)}<animate attributeName="opacity" values="1;0.2;1" dur="${(1.8 + i * 0.4).toFixed(1)}s" repeatCount="indefinite"/></g>`,
     )
     .join('')
-  const status = !busy
+  const doing = !busy
     ? 'waiting for you'
-    : isHandoff(lead.tool)
+    : c.lead.ultra
+      ? 'running a workflow…'
+      : isHandoff(lead.tool)
       ? 'handing out work…'
       : lead.tool && groupOf(lead.tool)
         ? `⚙ ${cut(toolWords(lead.tool), 30)}`
         : 'thinking…'
+  const status = lead.asked ? `⚠ asked ${lead.asked} · ${doing}` : doing
+  const glow = ultra
+    ? `<circle cx="${cx}" cy="${cy}" r="${r + 34}" fill="url(#crew-ultra-glow)" shape-rendering="geometricPrecision"><animate attributeName="opacity" values="0.6;1;0.6" dur="2.4s" repeatCount="indefinite"/></circle>`
+    : ''
+  const outer = ultra
+    ? `<circle cx="${cx}" cy="${cy}" r="${r + 10}" fill="none" stroke="url(#crew-ultra)" stroke-width="2" stroke-dasharray="3 7" shape-rendering="geometricPrecision"><animateTransform attributeName="transform" type="rotate" values="360 ${cx} ${cy};0 ${cx} ${cy}" dur="12s" repeatCount="indefinite"/></circle>`
+    : `<circle cx="${cx}" cy="${cy}" r="${r + 10}" fill="none" stroke="${FAINT}" stroke-opacity="0.6" stroke-width="1" stroke-dasharray="1 10"/>`
   front.push(
-    `<circle cx="${cx}" cy="${cy}" r="${r}" fill="${BG}" stroke="${leadColor}" stroke-opacity="0.75" stroke-width="1.6" stroke-dasharray="1.6 6">${spin}</circle>`,
-    `<circle cx="${cx}" cy="${cy}" r="${r + 10}" fill="none" stroke="${FAINT}" stroke-opacity="0.6" stroke-width="1" stroke-dasharray="1 10"/>`,
+    glow,
+    `<circle cx="${cx}" cy="${cy}" r="${r}" fill="${BG}" stroke="${ultra ? 'url(#crew-ultra)' : leadColor}" stroke-opacity="${ultra ? 1 : 0.75}" stroke-width="${ultra ? 2.2 : 1.6}" stroke-dasharray="1.6 6">${spin}</circle>`,
+    outer,
     chev(CHEV_L, cx - r - 32, -4),
     chev(CHEV_R, cx + r + 23, 4),
     sparks,
     creature(lead.family, cx, cy + creatureHeight(lead.family, L.px) / 2, L.px, busy ? 'working' : 'idle', 1),
-    `<text x="${cx}" y="${L.labelY}" text-anchor="middle" font-size="11.5" font-weight="700" fill="${leadColor}">${esc(lead.model.toUpperCase())}<tspan fill="${MUTED}" font-weight="400"> · lead</tspan></text>`,
-    `<text x="${cx}" y="${L.statusY}" text-anchor="middle" font-size="10" fill="${busy ? INK : MUTED}">${esc(status)}</text>`,
+    `<text x="${cx}" y="${L.labelY}" text-anchor="middle" font-size="11.5" font-weight="700" fill="${leadColor}">${esc(lead.model.toUpperCase())}<tspan fill="${MUTED}" font-weight="400"> · lead</tspan>${lead.asked ? `<tspan fill="${AMBER}"> ⚠</tspan>` : ''}</text>`,
+    `<text x="${cx}" y="${L.statusY}" text-anchor="middle" font-size="10" fill="${lead.asked ? AMBER : busy ? INK : MUTED}">${esc(status)}</text>`,
   )
 
   // the helpers
@@ -656,10 +739,17 @@ export function crewSvg(c: Crew, L: Layout, now: number): string {
         : a.status === 'done'
           ? `<text x="${x + 24}" y="${top + 11}" font-size="10" fill="${MUTED}">✓</text>`
           : ''
+    const lit = isWorking && !!a.run
     front.push(
+      lit
+        ? `<rect x="${x - 46}" y="${top - 12}" width="92" height="78" fill="url(#crew-ultra-glow)"><animate attributeName="opacity" values="0.55;1;0.55" dur="2.4s" begin="${(i * 0.3).toFixed(1)}s" repeatCount="indefinite"/></rect>`
+        : '',
       `<rect x="${x - 34}" y="${top}" width="68" height="54" fill="${PANEL}"/>`,
-      corners(x - 34, top, 68, 54, awake ? color : LINE),
-      `<text x="${x}" y="${top - 7}" text-anchor="middle" font-size="9.5" font-weight="700" fill="${isWorking ? color : MID}">${esc(cut(a.model.toUpperCase(), chars))}</text>`,
+      corners(x - 34, top, 68, 54, lit ? 'url(#crew-ultra)' : awake ? color : LINE),
+      `<text x="${x}" y="${top - 7}" text-anchor="middle" font-size="9.5" font-weight="700" fill="${isWorking ? color : MID}">${esc(cut(a.model.toUpperCase(), chars - (a.asked ? 2 : 0)))}${a.asked ? `<tspan fill="${AMBER}"> ⚠</tspan>` : ''}</text>`,
+      a.asked
+        ? `<text x="${x}" y="${top + 106}" text-anchor="middle" font-size="8.5" fill="${AMBER}">${esc(cut(`asked ${a.asked}`, chars + 2))}</text>`
+        : '',
       mark,
       creature(a.family, x, top + 47, 3, awake ? 'working' : isWorking ? 'idle' : 'dim', i + 2),
       wrap(a.task, chars, 2)
@@ -695,10 +785,12 @@ export function crewSvg(c: Crew, L: Layout, now: number): string {
   const done = c.agents.length - working.length
   const tally = `${working.length} working · ${done} done`
   return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${W} ${H}" width="100%" font-family="ui-monospace, 'Cascadia Mono', Consolas, Menlo, monospace" shape-rendering="crispEdges">
-<defs><pattern id="crew-dots" width="16" height="16" patternUnits="userSpaceOnUse"><rect x="7" y="7" width="1.5" height="1.5" fill="${DOT}"/></pattern></defs>
+<defs><pattern id="crew-dots" width="16" height="16" patternUnits="userSpaceOnUse"><rect x="7" y="7" width="1.5" height="1.5" fill="${DOT}"/></pattern>
+<linearGradient id="crew-ultra" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="${PINK}"/><stop offset="1" stop-color="${VIOLET}"/></linearGradient>
+<radialGradient id="crew-ultra-glow"><stop offset="0.5" stop-color="#c26bff" stop-opacity="0.6"/><stop offset="0.78" stop-color="${PINK}" stop-opacity="0.24"/><stop offset="1" stop-color="${VIOLET}" stop-opacity="0"/></radialGradient></defs>
 <rect width="${W}" height="${H}" fill="${BG}"/>
 <rect width="${W}" height="${H}" fill="url(#crew-dots)"/>
-<text x="16" y="22" font-size="12" font-weight="700" fill="${INK}">✻ agent crew</text>
+<text x="16" y="22" font-size="12" font-weight="700" fill="${INK}">✻ agent crew${ultra ? `<tspan fill="url(#crew-ultra)" font-weight="700">  ✦ ultracode</tspan>` : ''}</text>
 <text x="${W - 16}" y="22" text-anchor="end" font-size="10" fill="${MUTED}">${tally}</text>
 ${unseen ? `<text x="${W - 16}" y="35" text-anchor="end" font-size="9" fill="${MID}">+${unseen} more working, listed below</text>` : ''}
 ${pixelRows(CROSS, 16, H - 22, 2, FAINT)}${pixelRows(CROSS, W - 22, H - 22, 2, FAINT)}
@@ -715,10 +807,17 @@ export function paradeSvg(c: Crew, px: number, max: number): { source: string; w
   const gap = 3 * px
   const height = 10 * px + 2
   const width = cw + (working.length ? gap + working.length * (cw + gap) : 0)
-  const parts = [creature(c.lead.family, cw / 2, height, px, c.lead.busy ? 'working' : 'idle', 0)]
+  const lead = shownLead(c.lead)
+  const parts = isUltra(c)
+    ? [
+        `<defs><radialGradient id="parade-ultra"><stop offset="0.3" stop-color="#c26bff" stop-opacity="0.75"/><stop offset="0.7" stop-color="${PINK}" stop-opacity="0.3"/><stop offset="1" stop-color="${VIOLET}" stop-opacity="0"/></radialGradient></defs>`,
+        `<ellipse cx="${cw / 2}" cy="${height / 2 + px}" rx="${cw / 2 + px}" ry="${height / 2 + px}" fill="url(#parade-ultra)" shape-rendering="geometricPrecision"/>`,
+      ]
+    : []
+  parts.push(creature(lead.family, cw / 2, height, px, c.lead.busy ? 'working' : 'idle', 0))
   if (working.length) parts.push(`<rect x="${cw + gap - px / 2}" y="${height - 4 * px}" width="${px}" height="${px}" fill="${FAINT}"/>`)
   working.forEach((a, i) => {
-    parts.push(creature(a.family, cw + gap * 2 + i * (cw + gap) + cw / 2 - gap / 2, height, px, a.resting ? 'idle' : 'working', i + 1))
+    parts.push(creature(shown(a).family, cw + gap * 2 + i * (cw + gap) + cw / 2 - gap / 2, height, px, a.resting ? 'idle' : 'working', i + 1))
   })
   return {
     source: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${width} ${height}" width="${width}" height="${height}" shape-rendering="crispEdges">${parts.join('')}</svg>`,

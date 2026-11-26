@@ -17,13 +17,18 @@ import {
   fmtTokens,
   groupOf,
   isShown,
+  isUltra,
   layoutFor,
   paradeSvg,
   prettyModel,
   setLead,
+  setReplied,
   setResting,
   setTokens,
+  setUltra,
   showTool,
+  shown,
+  shownLead,
   startOver,
   toolWords,
   visibleHelpers,
@@ -58,6 +63,8 @@ let mirror: Crew | undefined
 let ticker: Stop | undefined
 let ticks = 0
 let callSeq = 0
+/** Workflow calls of the lead under way. */
+let workflows = 0
 /** Tool calls under way, by who makes them. */
 const flights = new Map<string, Map<string, string>>()
 /** The timer that puts out a finished call's light. */
@@ -138,6 +145,8 @@ async function tick($: EngineInterface): Promise<void> {
     quiet.delete(a.id)
     const s = info.status
     next = setTokens(next, a.id, Math.round(info.tokenCount / 1000) * 1000)
+    const answered = info.lastRequest?.model ?? info.model
+    if (answered) next = setReplied(next, a.id, answered, now)
     if (s === 'completed') next = ended(next, a.id, true, now)
     else if (s === 'failed' || s === 'killed') next = ended(next, a.id, false, now)
     else next = setResting(next, a.id, s !== 'running')
@@ -278,13 +287,26 @@ export const register: Register = on => {
   })
 
   on('turn.complete', ($, e, next) => {
+    const model = e.usage?.model
     if (e.agentId === undefined) {
       flights.delete(LEAD)
       fading.get(LEAD)?.cancel()
       fading.delete(LEAD)
-      change($, c => setLead(c, false))
+      change($, (c, now) => {
+        const idle = setLead(c, false)
+        return model ? setReplied(idle, undefined, model, now) : idle
+      })
     } else {
-      quiet.delete(e.agentId)
+      const id = e.agentId
+      quiet.delete(id)
+      const ok = e.reason === 'answer'
+      change($, (c, now) => {
+        let n = model ? setReplied(c, id, model, now) : c
+        // a workflow's agents send no report: their turn ending is their end
+        const a = n.agents.find(x => x.id === id)
+        if (a?.run && a.status === 'working') n = ended(n, id, ok, now)
+        return n
+      })
     }
     return next(e)
   })
@@ -295,6 +317,16 @@ export const register: Register = on => {
     if (who) {
       calls.set(who, (calls.get(who) ?? 0) + 1)
       quiet.delete(who)
+    }
+    if (tool === 'Workflow' && who === LEAD) {
+      workflows++
+      change($, c => setUltra(c, true))
+      try {
+        return await next(e)
+      } finally {
+        workflows = Math.max(0, workflows - 1)
+        if (workflows === 0) change($, c => setUltra(c, false))
+      }
     }
     if (!isShown(tool)) return next(e)
     const id = e.tool_use_id || `call-${++callSeq}`
@@ -311,16 +343,19 @@ export const register: Register = on => {
     if (result.deny !== undefined || !result.agentId) return result
     const id = result.agentId
     const raw = result.model || e.model || e.parentModel
+    const run = e.workflow?.runId || undefined
+    const task = e.description || (e.workflow ? `workflow agent ${e.workflow.agentIndex}` : e.subagentType)
     quiet.delete(id)
     change($, (c, now) => {
       const agent: CrewAgent = {
         id,
         model: prettyModel(raw),
         family: familyOf(raw),
-        task: e.description || e.subagentType,
+        task,
         type: e.subagentType,
         status: 'working',
         ...(e.parentAgentId ? { parentId: e.parentAgentId } : {}),
+        ...(run ? { run } : {}),
         startedAt: now,
       }
       const boss = e.parentAgentId ? (c.agents.find(a => a.id === e.parentAgentId)?.model ?? 'Helper') : undefined
@@ -341,18 +376,21 @@ export const register: Register = on => {
     const now = await $.clock.now()
     const working = c.agents.filter(a => a.status === 'working')
     const recent = c.log.slice(-6).reverse()
+    const lead = shownLead(c.lead)
+    const ultra = isUltra(c)
 
     if (e.surface === 'terminal') {
       const { Box, Text } = $.ui.resolve(e)
       return (
         <Box flexDirection="column">
           <Text bold>
-            ✻ {c.lead.model} leading · {working.length} working
+            ✻ {lead.model} leading{lead.asked ? ` (asked ${lead.asked})` : ''} · {working.length} working{ultra ? ' · ✦ ultracode' : ''}
           </Text>
           {c.agents.length === 0 && <Text dimColor>No helpers yet.</Text>}
-          {visibleHelpers(c, 10).map(a => (
+          {visibleHelpers(c, 10).map(shown).map(a => (
             <Text dimColor={a.status !== 'working'}>
-              {a.status === 'working' ? (a.resting ? '○' : '●') : a.status === 'failed' ? '✗' : '✓'} {a.model}: {cut(a.task, 40)}
+              {a.status === 'working' ? (a.resting ? '○' : '●') : a.status === 'failed' ? '✗' : '✓'} {a.model}
+              {a.asked ? ` (asked ${a.asked})` : ''}: {cut(a.task, 40)}
               {a.status === 'working' && a.tool && groupOf(a.tool) ? ` [${toolWords(a.tool)}]` : ''}
             </Text>
           ))}
@@ -367,21 +405,26 @@ export const register: Register = on => {
     }
 
     const { Box, Text, Svg, Button } = $.ui.resolve(e)
-    const alt = `Agent crew. ${c.lead.model} leading, ${working.length} helpers working. ${working.map(a => `${a.model}: ${a.task}`).join('; ')}`
+    const alt = `Agent crew. ${lead.model} leading${ultra ? ', Ultracode workflow running' : ''}, ${working.length} helpers working. ${working
+      .map(shown)
+      .map(a => `${a.model}${a.asked ? ` (asked ${a.asked})` : ''}: ${a.task}`)
+      .join('; ')}`
 
     if (e.props.placement === 'widget') {
       const parade = paradeSvg(c, 3, 4)
       return (
         <Box flexDirection="column">
           <Svg source={parade.source} alt={alt} width={parade.width} height={parade.height} />
-          <Text bold>{c.lead.model} leading</Text>
-          <Text dimColor>{working.length ? working.map(a => a.model).join(', ') + ' working' : 'no helpers working'}</Text>
+          <Text bold>
+            {lead.model} leading{ultra ? ' · ✦ ultracode' : ''}
+          </Text>
+          <Text dimColor>{working.length ? working.map(a => shown(a).model).join(', ') + ' working' : 'no helpers working'}</Text>
         </Box>
       )
     }
 
     const L = layoutFor(e.props.bodyColumns)
-    const rows = visibleHelpers(c, 12)
+    const rows = visibleHelpers(c, 12).map(shown)
     return (
       <Box flexDirection="column">
         <Svg source={crewSvg(c, L, now)} alt={alt} isInteractive width={L.W} height={L.H} />
@@ -389,7 +432,9 @@ export const register: Register = on => {
         {rows.map(a => (
           <Text dimColor={a.status !== 'working'}>
             <Text color={COLOR[a.family]}>■ </Text>
-            {a.model} · {stateWords(a, now)} · {cut(a.task, 90)}
+            {a.model}
+            {a.asked ? ` (asked ${a.asked})` : ''}
+            {a.run ? ' · workflow' : ''} · {stateWords(a, now)} · {cut(a.task, 90)}
           </Text>
         ))}
         <Text bold>Activity</Text>
@@ -418,9 +463,10 @@ export const register: Register = on => {
       working.length === 0
         ? ''
         : working.length <= 2
-          ? ` · ${working.map(a => a.model).join(', ')} working`
+          ? ` · ${working.map(a => shown(a).model).join(', ')} working`
           : ` · ${working.length} helpers working`
-    const words = `${c.lead.model} leading${crewWords}`
+    const lead = shownLead(c.lead)
+    const words = `${lead.model}${lead.asked ? ' ⚠' : ''} leading${isUltra(c) ? ' · ✦ ultracode' : ''}${crewWords}`
     const label = open ? 'Hide crew' : 'Show crew'
     const press = async () => {
       await toggle($)

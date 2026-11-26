@@ -52,8 +52,9 @@ function report(agentId: string, status: 'completed' | 'failed' | 'stopped' = 'c
   return { agentId, subagentType: 'general-purpose', provider: ENGINE, status, text: 'done' }
 }
 
-function listed(id: string, status: AgentInfo['status']): AgentInfo {
+function listed(id: string, status: AgentInfo['status'], answeredBy?: string): AgentInfo {
   return {
+    ...(answeredBy ? { lastRequest: { at: 1000, model: answeredBy } } : {}),
     id,
     description: 'x',
     type: 'general-purpose',
@@ -93,8 +94,11 @@ function engine(on: On, model = 'claude-fable-5-2') {
   on('agent.list', () => ({ value: [...agents] }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('agent.report', (_, e) => ({ text: e.text }))
-  on('tool.call', (_, e) => {
+  on('turn.complete', (_, e) => ({ text: e.answer }))
+  on('tool.call', async (_, e) => {
     seen.push(String(e.tool))
+    // a workflow runs for a while
+    if (e.tool === 'Workflow') await clock.sleep(10_000)
     return { result: {} }
   })
   return { clock, seen, panes, agents }
@@ -261,4 +265,111 @@ test('a small widget shows the lead and who is working', async ($, on) => {
   expect((await ui.find({ type: 'Text', text: /leading/ }))?.text).toBe('Fable 5.2 leading')
   expect((await ui.find({ type: 'Text', text: /working/ }))?.text).toBe('Opus 5.5 working')
   await ui.unmount()
+})
+
+/** A turn ending, as the engine raises it. */
+function turnEnd(answeredBy: string, agentId?: string) {
+  return {
+    answer: 'ok',
+    durationMs: 10,
+    isAborted: false,
+    turnId: 't1',
+    reason: 'answer' as const,
+    usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, model: answeredBy },
+    ...(agentId ? { agentId } : {}),
+  }
+}
+
+test('a helper that falls back shows the model asked for and the one replying', async ($, on) => {
+  const { clock, agents } = engine(on)
+  on('agent.spawn', () => ({ model: 'claude-opus-5-5', agentId: 'a1' }))
+
+  await $.session.start(START)
+  await $.agent.spawn(spawn('Write the save system'))
+  agents.push(listed('a1', 'running', 'claude-sonnet-5-5-20261001'))
+  await clock.advance(5000)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  const source = String((await ui.find({ type: 'Svg' }))?.props.source)
+  expect(source).toContain('SONNET 5.5')
+  expect(source).toContain('asked Opus 5.5')
+  expect((await ui.find({ type: 'Text', text: /asked Opus/ }))?.text).toContain('Sonnet 5.5 (asked Opus 5.5)')
+  expect((await ui.find({ type: 'Text', text: /fell back/ }))?.text).toContain('Opus 5.5 fell back to Sonnet 5.5')
+  await ui.unmount()
+
+  const term = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect((await term.find({ type: 'Text', text: /asked Opus/ }))?.text).toContain('● Sonnet 5.5 (asked Opus 5.5)')
+  await term.unmount()
+})
+
+test('an alias and its full name are not a fallback', async ($, on) => {
+  const { clock, agents } = engine(on)
+  on('agent.spawn', () => ({ model: 'sonnet', agentId: 'a1' }))
+
+  await $.session.start(START)
+  await $.agent.spawn(spawn('Review the code'))
+  agents.push(listed('a1', 'running', 'claude-sonnet-5-5'))
+  await clock.advance(5000)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  const source = String((await ui.find({ type: 'Svg' }))?.props.source)
+  expect(source).toContain('SONNET 5.5')
+  expect(source.includes('asked')).toBe(false)
+  expect(await ui.find({ type: 'Text', text: /fell back/ })).toBe(undefined)
+  await ui.unmount()
+})
+
+test('the lead shows when its replies come from another model', async ($, on) => {
+  const { clock } = engine(on)
+
+  await $.session.start(START)
+  await $.turn.complete(turnEnd('claude-opus-5-5'))
+  await clock.settle()
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  const source = String((await ui.find({ type: 'Svg' }))?.props.source)
+  expect(source).toContain('OPUS 5.5')
+  expect(source).toContain('asked Fable 5.2')
+  await ui.unmount()
+
+  const band = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect((await band.find({ type: 'Text', text: /leading/ }))?.text).toContain('Opus 5.5 ⚠ leading')
+  await band.unmount()
+})
+
+test('an Ultracode workflow glows pink and purple while it runs', async ($, on) => {
+  const { clock } = engine(on)
+  on('agent.spawn', () => ({ model: 'claude-sonnet-5-5', agentId: 'w1' }))
+
+  await $.session.start(START)
+  const run = $.tool.call({ tool: 'Workflow', name: 'build the level' })
+  await clock.settle()
+  await $.agent.spawn({ ...spawn(''), workflow: { runId: 'wf_1', agentIndex: 1 } })
+  await clock.settle()
+
+  for (const surface of ['desktop', 'mobile'] as const) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    const source = String((await ui.find({ type: 'Svg' }))?.props.source)
+    expect(source).toContain('url(#crew-ultra-glow)')
+    expect(source).toContain('✦ ultracode')
+    expect(source).toContain('running a workflow')
+    expect((await ui.find({ type: 'Text', text: /workflow agent 1/ }))?.text).toContain('Sonnet 5.5 · workflow')
+    await ui.unmount()
+  }
+  const band = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect((await band.find({ type: 'Text', text: /leading/ }))?.text).toContain('✦ ultracode')
+  await band.unmount()
+
+  // a workflow agent sends no report: its turn ending ends it
+  await $.turn.complete(turnEnd('claude-sonnet-5-5', 'w1'))
+  await clock.advance(10_000)
+  await run
+  await clock.settle()
+
+  const after = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  const calm = String((await after.find({ type: 'Svg' }))?.props.source)
+  expect(calm.includes('url(#crew-ultra-glow)')).toBe(false)
+  expect(calm.includes('✦ ultracode')).toBe(false)
+  expect((await after.find({ type: 'Text', text: /workflow agent 1/ }))?.text).toContain('done in')
+  await after.unmount()
 })

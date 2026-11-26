@@ -41,6 +41,8 @@ It shows up in every session you start after that, in every project. No account,
 - **Its helpers**: every agent the lead hands work to, with its model, its task, and what it is doing right now. Lines show who handed work to whom, including a helper that starts a helper of its own.
 - **Tools and MCP servers**: each one lights up while it is in use. Built-in tools are grouped as terminal, files and web. Every MCP server you have connected gets its own node automatically, whatever it is: Blender, an image generator, mail, a database, your own server.
 - **The details**: a list of each helper's task, time, tool calls and tokens, and a short activity log of handoffs and finished work.
+- **Fallbacks**: every badge follows the model that is really replying, live. When that is not the model that was asked for, the badge gets a ⚠ and shows the one asked for underneath, so a fallback is easy to spot.
+- **Ultracode**: while an Ultracode workflow runs, the lead and the workflow's agents glow pink and purple.
 
 Every model family has its own creature and color, so you can tell at a glance which model is doing which job:
 
